@@ -93,6 +93,14 @@ jobs:
             grep -nE "TERMUX_PKG_SRCURL=|TERMUX_PKG_SHA256=" "$build"
           done
 
+          # GitHub regenerated the archive for SRT's immutable v1.5.7 tag after this
+          # Termux pin recorded its checksum. The downloaded source still identifies as
+          # v1.5.7; update only the stale archive digest so all architectures agree.
+          if [ -f packages/libsrt/build.sh ]; then
+            sed -i -E 's|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b|' packages/libsrt/build.sh
+            grep -nE '^TERMUX_PKG_(SRCURL|SHA256)=' packages/libsrt/build.sh
+          fi
+
           # Network fallback ONLY for packages the committed files didn't cover.
           # download-mirror.savannah.gnu.org is Savannah's dedicated mirror host (https,
           # tolerates datacenter IPs — the legacy download.savannah.{gnu,nongnu}.org hosts
