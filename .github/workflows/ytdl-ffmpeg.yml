@@ -416,10 +416,11 @@ jobs:
           if [ -f packages/termux-tools/build.sh ]; then
             sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
             sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
+            sed -i -E 's/[[:space:]]*,?[[:space:]]*tar-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
             sed -i -E 's/,,/,/g; s/\(\s*,/\(/; s/,\s*\)/\)/' packages/termux-tools/build.sh
             grep -nE "^TERMUX_PKG_DEPENDS=" packages/termux-tools/build.sh
           fi
-
+          
       # Mirrors upstream BUILD_FFMPEG.md from youtubedl-android. The custom TERMUX_PREFIX is
       # essential: stock Termux binaries bake /data/data/com.termux/... into their rpath and
       # cannot locate their own shared libs from another app's data dir.
