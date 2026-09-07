@@ -1,4 +1,4 @@
-name: build-ffmpeg-with-fallback
+name: build-ffmpeg
 
 on:
   workflow_dispatch:
@@ -94,279 +94,94 @@ jobs:
 
           ./find-all-deps.sh ffmpeg
 
-      # Step 2: Disable validation for committed files
-      - name: Setup validation skip for committed files
-        working-directory: termux-packages
-        run: |
-          set -euxo pipefail
-          mkdir -p .committed-packages
-          rm -f .committed-packages/packages.txt
-          touch .committed-packages/packages.txt
-          shopt -s nullglob
-          for f in "$GITHUB_WORKSPACE"/.github/workflows/deps/*; do
-            [ -f "$f" ] || continue
-            case "$f" in *.sig) continue ;; esac
-
-            name=$(basename "$f")
-            pkg="${name%%-[0-9]*}"
-
-            case "$pkg" in
-              acl) pkg="libacl" ;;
-              dav1d) pkg="libdav1d" ;;
-              srt) pkg="libsrt" ;;
-              openh264) pkg="libopenh264" ;;
-              webrtc-audio-processing) pkg="libwebrtc-audio-processing" ;;
-              x264) pkg="libx264" ;;
-            esac
-
-            if [ -f "packages/$pkg/build.sh" ]; then
-              echo "$pkg" >> .committed-packages/packages.txt
-            fi
-          done
-          shopt -u nullglob
-          sort -u -o .committed-packages/packages.txt .committed-packages/packages.txt
-          cat .committed-packages/packages.txt || true
-
-      # Step 3: Download missing deps with multi-mirror fallback
-      - name: Download missing dependencies with fallback
-        working-directory: termux-packages
-        run: |
-          set -euxo pipefail
-          mkdir -p downloads-pre
-          cat > download-with-fallback.sh <<'EOF'
-          #!/bin/bash
-          set -euo pipefail
-
-          mkdir -p downloads-pre
-
-          # Mirrors are host roots; fallback appends the full path
-          # after the original host (single ${url#*://*/} strip).
-          # The old table baked the first path component into the
-          # mirror (e.g. .../gnu) AND stripped it from the URL, which
-          # worked for gnu but dropped the org from github URLs.
-          declare -A MIRRORS=(
-            [gnu]="https://mirrors.kernel.org https://ftp.gnu.org"
-            [nongnu]="https://download-mirror.savannah.gnu.org https://mirror.csclub.uwaterloo.ca"
-            [sourceforge]="https://downloads.sourceforge.net https://phoenixnap.dl.sourceforge.net"
-            [github]="https://github.com https://raw.githubusercontent.com"
-            [ffmpeg]="https://ffmpeg.org https://www.ffmpeg.org"
-            [videolan]="https://downloads.videolan.org https://ftp.videolan.org"
-          )
-
-          get_mirror_type() {
-            local url="$1"
-            case "$url" in
-              *gnu.org*) echo "gnu" ;;
-              *nongnu.org*|*savannah*) echo "nongnu" ;;
-              *sourceforge.net*) echo "sourceforge" ;;
-              *github.com*|*githubusercontent.com*) echo "github" ;;
-              *ffmpeg.org*) echo "ffmpeg" ;;
-              *videolan.org*|*x264*) echo "videolan" ;;
-              *) echo "generic" ;;
-            esac
-          }
-
-          # First SRCURL entry only; recipes may use
-          # TERMUX_PKG_SRCURL="url" or TERMUX_PKG_SRCURL=( "u1" "u2" ).
-          # Recipes almost always interpolate variables, e.g.
-          #   TERMUX_PKG_SRCURL=https://downloads.videolan.org/.../${TERMUX_PKG_VERSION}/...
-          # so the raw grep hit must be expanded against the recipe's own
-          # TERMUX_PKG_VERSION/NAME assignments before curling. Unresolvable
-          # entries (still containing $ after expansion) and VCS URLs are
-          # skipped here — build-package.sh handles git checkouts itself.
-          get_pkg_var() {
-            grep -E "^TERMUX_PKG_$2=" "$1" \
-              | head -1 | sed -e 's/^[^=]*=//' -e 's/^["'"' ]*//;s/["'"' ]*$//' || true
-          }
-
-          get_srcurl() {
-            local build="$1"
-            local raw
-            raw=$(grep -E '^TERMUX_PKG_SRCURL=' "$build" \
-              | grep -oE '(https?|git)[^" )]+' | head -1 || true)
-            [ -z "$raw" ] && return 0
-            case "$raw" in git*|*\.git) return 0 ;; esac
-            local ver name
-            ver=$(get_pkg_var "$build" VERSION)
-            name=$(get_pkg_var "$build" NAME)
-            [ -z "$name" ] && name=$(basename "$(dirname "$build")")
-            case "$raw" in *TERMUX_PKG_VERSION*)
-              [ -z "$ver" ] && return 0 ;;
-            esac
-            case "$raw" in *TERMUX_PKG_NAME*)
-              [ -z "$name" ] && return 0 ;;
-            esac
-            local expanded="$raw"
-            # eval-free expansion of the two vars recipes actually use.
-            expanded=${expanded//'${TERMUX_PKG_VERSION}'/"$ver"}
-            expanded=${expanded//'$TERMUX_PKG_VERSION'/"$ver"}
-            expanded=${expanded//'${TERMUX_PKG_NAME}'/"$name"}
-            expanded=${expanded//'$TERMUX_PKG_NAME'/"$name"}
-            case "$expanded" in *'$'*|*'{'*|*'}'*) return 0 ;; esac
-            echo "$expanded"
-          }
-
-          get_sha256() {
-            grep -E '^TERMUX_PKG_SHA256=' "$1" \
-              | grep -oE '[0-9a-f]{64}' | head -1 || true
-          }
-
-          download_with_fallback() {
-            local url="$1"
-            local output="$2"
-            local expected_sha="$3"
-
-            if curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 120 \
-                 --connect-timeout 15 --max-time 300 \
-                 -o "$output" "$url"; then
-              if [ -n "$expected_sha" ]; then
-                if echo "$expected_sha  $output" | sha256sum -c -; then
-                  return 0
-                else
-                  echo "::warning::primary URL checksum mismatch: $url"
-                  rm -f "$output"
-                fi
-              else
-                return 0
-              fi
-            fi
-
-            local mirror_type
-            mirror_type=$(get_mirror_type "$url")
-            [ "$mirror_type" = "generic" ] && return 1
-            local mirrors="${MIRRORS[$mirror_type]}"
-            local path="${url#*://*/}"
-
-            for mirror in $mirrors; do
-              local fallback_url="${mirror}/${path}"
-              [ "$fallback_url" = "$url" ] && continue
-              echo "::notice::trying fallback $fallback_url"
-              if curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 120 \
-                   --connect-timeout 15 --max-time 300 \
-                   -o "$output" "$fallback_url"; then
-                if [ -n "$expected_sha" ]; then
-                  if echo "$expected_sha  $output" | sha256sum -c -; then
-                    return 0
-                  else
-                    echo "::warning::fallback checksum mismatch: $fallback_url"
-                    rm -f "$output"
-                  fi
-                else
-                  return 0
-                fi
-              fi
-            done
-
-            return 1
-          }
-
-          # Best effort: failures are tolerated here, the committed-tarballs
-          # step plus the attr/libacl fallback below are the trust anchor.
-          while IFS= read -r pkg; do
-            [ -z "$pkg" ] && continue
-
-            build_script="packages/$pkg/build.sh"
-            [ ! -f "$build_script" ] && continue
-
-            srcurl=$(get_srcurl "$build_script")
-            sha256=$(get_sha256 "$build_script")
-
-            [ -z "$srcurl" ] && continue
-
-            fname=$(basename "${srcurl%%\?*}")
-            output_file="downloads-pre/$fname"
-
-            if [ ! -f "$output_file" ]; then
-              if download_with_fallback "$srcurl" "$output_file" "$sha256"; then
-                echo "::notice::pre-fetched $pkg ($fname)"
-              else
-                echo "::warning::could not pre-fetch $pkg from $srcurl"
-              fi
-            fi
-          done < missing-packages.txt
-          EOF
-          chmod +x download-with-fallback.sh
-
-          # Generate missing packages list
-          rm -f missing-packages.txt
-          touch missing-packages.txt
-          grep -v "^$" all-dependencies.txt 2>/dev/null | \
-          while IFS= read -r pkg; do
-            [ -z "$pkg" ] && continue
-            if ! grep -qxF "$pkg" .committed-packages/packages.txt 2>/dev/null; then
-              echo "$pkg"
-            fi
-          done > missing-packages.txt || true
-
-          cat missing-packages.txt || true
-          ./download-with-fallback.sh || echo "::warning::pre-fetch had failures, continuing to committed tarballs"
-
-      # Savannah's download hosts 502/504 constantly from CI, so there is NO network
-      # fallback here: any source tarball the build can't fetch reliably is committed to
-      # .github/workflows/deps/ (downloaded once by hand from a working mirror). For each
-      # committed tarball we locate the matching termux package recipe, point it at the
-      # local file via termux_download's file:// passthrough, and pin the recipe's SHA256
-      # to the committed file's actual hash. The repo commit is the trust anchor from then
-      # on; the .sig files kept next to the tarballs record upstream provenance.
-      # Note: files for packages whose recipes are named differently from upstream tarballs
-      # are mapped below, e.g. acl sources belong to Termux's libacl package.
+      # Step 2: Wire committed tarballs, then enforce full coverage.
+      # Hermetic by design: there is NO network fallback. Every source the
+      # build needs must already sit in .github/workflows/deps/, vendored
+      # locally with scripts/vendor-termux-sources.ps1 (which verifies each
+      # SHA256 against its recipe before you commit it).
+      # For each tarball we find its recipe by longest prefix match and point
+      # that recipe at the local file via termux_download's file://
+      # passthrough. Only TERMUX_PKG_SRCURL is rewritten — the recipe's
+      # TERMUX_PKG_SHA256 is left untouched so the pristine upstream tarball
+      # still verifies exactly as recorded.
       - name: Use committed source tarballs
         working-directory: termux-packages
         run: |
           set -euxo pipefail
           mkdir -p downloads-pre
-          # Fail fast when the tarballs are missing from the checkout (e.g. synced the
-          # workflow but not the binaries) — silently falling through would send the build
-          # back to Savannah's 502s an hour later.
           shopt -s nullglob
           dep_files=("$GITHUB_WORKSPACE"/.github/workflows/deps/*)
           shopt -u nullglob
-          # Filter out .gitkeep/.sig so an empty deps/ dir still fails fast.
           real_files=()
           for f in "${dep_files[@]}"; do
             [ -f "$f" ] || continue
-            case "$f" in *.sig|*.gitkeep) continue ;; esac
+            case "$f" in *.gitkeep) continue ;; esac
             real_files+=("$f")
           done
           if [ ${#real_files[@]} -eq 0 ]; then
-            echo "::error::No tarballs found in .github/workflows/deps/ — the checkout must contain them. Directory contents:"
+            echo "::error::No tarballs in .github/workflows/deps/ — run scripts/vendor-termux-sources.ps1 and commit the bundle first."
             ls -la "$GITHUB_WORKSPACE"/.github/workflows/deps/ || true
             exit 1
           fi
+
+          # "tarball-prefix:recipe" pairs: every recipe name, plus the
+          # upstream prefixes that differ from their recipe
+          # (acl sources build Termux's libacl package, etc.).
+          mapfile -t PREFIXMAP < <(
+            for d in packages/*/; do
+              r=$(basename "$d")
+              echo "$r:$r"
+            done
+            printf '%s\n' \
+              "acl:libacl" \
+              "dav1d:libdav1d" \
+              "srt:libsrt" \
+              "openh264:libopenh264" \
+              "x264:libx264" \
+              "webrtc-audio-processing:libwebrtc-audio-processing"
+          )
+
+          resolve_recipe() {
+            # $1 = tarball basename -> recipe dir name, or "" if none matches.
+            # Longest prefix wins, so libx264 beats x264 on libx264-... names.
+            # Handles '-' and '_' separators (x265_3.6.tar.gz) and the vendor
+            # script's "<pkg>-<version>" names for version-only upstreams.
+            local name="$1" best_len=0 best="" pair pre rec
+            for pair in "${PREFIXMAP[@]}"; do
+              pre="${pair%%:*}"; rec="${pair#*:}"
+              if [ "$name" = "$pre" ] || [[ "$name" == "$pre"-* ]] || [[ "$name" == "$pre"_* ]]; then
+                if [ ${#pre} -gt $best_len ] && [ -f "packages/$rec/build.sh" ]; then
+                  best_len=${#pre}; best="$rec"
+                fi
+              fi
+            done
+            echo "$best"
+          }
+
           point_recipe_at_file() {
-            local build="$1" fname="$2" sha="$3"
-            python3 - "$build" "$fname" "$sha" <<'PY'
+            local build="$1" fname="$2"
+            python3 - "$build" "$fname" <<'PY'
           import re, sys
-          build, fname, sha = sys.argv[1:4]
+          build, fname = sys.argv[1:3]
           src = f'TERMUX_PKG_SRCURL="file:///home/builder/termux-packages/downloads-pre/{fname}"'
-          dst = f'TERMUX_PKG_SHA256={sha}'
           txt = open(build).read()
-          # Collapse array forms first (SRCURL=( "u1" "u2" )), then single line.
-          txt = re.sub(r'TERMUX_PKG_SRCURL=\(.*?\)', src, txt, flags=re.S)
-          txt = re.sub(r'TERMUX_PKG_SRCURL=.*', src, txt)
-          txt = re.sub(r'TERMUX_PKG_SHA256=\(.*?\)', dst, txt, flags=re.S)
-          txt = re.sub(r'TERMUX_PKG_SHA256=.*', dst, txt)
-          open(build, 'w').write(txt)
+          new = re.sub(r'TERMUX_PKG_SRCURL=\(.*?\)', src, txt, flags=re.S)
+          new = re.sub(r'TERMUX_PKG_SRCURL=.*', src, new)
+          if new == txt:
+              raise SystemExit(f'no TERMUX_PKG_SRCURL rewritten in {build}')
+          open(build, 'w').write(new)
           PY
           }
+
           handled=""
           for f in "${real_files[@]}"; do
             name=$(basename "$f")
-            pkg="${name%%-[0-9]*}"
-            # Some Termux library recipes use a lib prefix absent from upstream tarballs.
-            case "$pkg" in
-              acl) pkg="libacl" ;;
-              dav1d) pkg="libdav1d" ;;
-              srt) pkg="libsrt" ;;
-              openh264) pkg="libopenh264" ;;
-              webrtc-audio-processing) pkg="libwebrtc-audio-processing" ;;
-              x264) pkg="libx264" ;;
-            esac
-            build="packages/$pkg/build.sh"
-            if [ ! -f "$build" ]; then
-              echo "::notice::no packages/$pkg/build.sh at this pin — skipping $name"
+            pkg=$(resolve_recipe "$name")
+            if [ -z "$pkg" ]; then
+              echo "::warning::cannot map $name to any recipe — skipping"
               continue
             fi
+            build="packages/$pkg/build.sh"
             # glob is alphabetical (.tar.gz before .tar.xz), so the FIRST file wins and
             # any alternate compression of the same package is skipped
             case " $handled " in *" $pkg "*)
@@ -375,73 +190,31 @@ jobs:
             esac
             handled="$handled $pkg"
             cp "$f" "downloads-pre/$name"
-            sha=$(sha256sum "downloads-pre/$name" | cut -d' ' -f1)
-            point_recipe_at_file "$build" "$name" "$sha"
-            echo "::notice::$name -> $pkg (sha $sha)"
-            grep -nE "TERMUX_PKG_SRCURL=|TERMUX_PKG_SHA256=" "$build"
+            point_recipe_at_file "$build" "$name"
+            echo "::notice::$name -> $pkg"
+            grep -nE "^TERMUX_PKG_SRCURL=" "$build"
           done
 
-          # GitHub regenerated the archive for SRT's immutable v1.5.7 tag after this
-          # Termux pin recorded its checksum. The downloaded source still identifies as
-          # v1.5.7; update only the stale archive digest so all architectures agree.
-          # Tied to TERMUX_PACKAGES_PIN — re-verify on pin bump.
-          if [ -f packages/libsrt/build.sh ]; then
-            if ! grep -q "file://" packages/libsrt/build.sh; then
-              python3 - packages/libsrt/build.sh 017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b <<'PY'
-          import re, sys
-          build, sha = sys.argv[1:3]
-          txt = open(build).read()
-          txt = re.sub(r'TERMUX_PKG_SHA256=\(.*?\)', f'TERMUX_PKG_SHA256={sha}', txt, flags=re.S)
-          txt = re.sub(r'TERMUX_PKG_SHA256=.*', f'TERMUX_PKG_SHA256={sha}', txt)
-          open(build, 'w').write(txt)
-          PY
-              grep -nE '^TERMUX_PKG_(SRCURL|SHA256)=' packages/libsrt/build.sh
-            else
-              echo "::notice::libsrt already pointed at committed tarball, skipping hardcoded SHA"
-            fi
-          fi
-
-          # Network fallback ONLY for packages the committed files didn't cover.
-          # download-mirror.savannah.gnu.org is Savannah's dedicated mirror host (https,
-          # tolerates datacenter IPs — the legacy download.savannah.{gnu,nongnu}.org hosts
-          # are effectively dead: they 502/504 from CI and timeout locally too).
-          # Hashes are the verified artifacts this repo's deps/ folder was built from.
-          # libacl (which builds the acl sources) is covered for future pin bumps; at this
-          # pin it's normally already handled from deps/.
-          # Tied to TERMUX_PACKAGES_PIN — re-verify hashes on pin bump.
-          for pkg in attr libacl; do
+          # Strict coverage: every dependency whose recipe fetches an http(s)
+          # tarball must have been wired to a committed file above. Git-only
+          # recipes need nothing. Gaps fail HERE, not an hour into docker.
+          gaps=""
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
             build="packages/$pkg/build.sh"
-            if [ ! -f "$build" ]; then
-              echo "::notice::$pkg has no recipe at this pin — fallback not needed"
-              continue
-            fi
-            grep -q "file://" "$build" && continue
-            echo "::notice::$pkg not covered by deps/ — trying network fallback"
-            if [ "$pkg" = attr ]; then
-              set -- \
-                "https://download-mirror.savannah.gnu.org/releases/attr/attr-2.6.0.tar.gz d42fa374513180bb48cb11a46696f488240e5124ff1e6ad88b0abff706985612" \
-                "https://download-mirror.savannah.gnu.org/releases/attr/attr-2.6.0.tar.xz 6c8a2148a7b85043b68492bce43316b0e2e214fc4e628c7ede078e76e216330b" \
-                "https://mirror.csclub.uwaterloo.ca/nongnu/attr/attr-2.6.0.tar.gz d42fa374513180bb48cb11a46696f488240e5124ff1e6ad88b0abff706985612"
-            elif [ "$pkg" = libacl ]; then
-              set -- \
-                "https://download-mirror.savannah.gnu.org/releases/acl/acl-2.4.0.tar.gz 73c853c3d44e1f693e5a96a986f1bd19d3d0dac2c7d453e796177774bc4e5f6a" \
-                "https://download-mirror.savannah.gnu.org/releases/acl/acl-2.4.0.tar.xz e661131456d2708a01c614a0f400e11d7d1bfaeb6f3e74b75bb980b72f0161a3"
-            fi
-            for entry in "$@"; do
-              url=${entry% *}; sha=${entry#* }
-              fname=$(basename "$url")
-              if curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 180 \
-                   --connect-timeout 20 -o "downloads-pre/$fname" "$url"; then
-                if echo "$sha  downloads-pre/$fname" | sha256sum -c -; then
-                  point_recipe_at_file "$build" "$fname" "$sha"
-                  echo "::notice::fallback download OK: $fname"
-                  break
-                fi
-                rm -f "downloads-pre/$fname"
-              fi
-            done
-            grep -q "file://" "$build" || { echo "::error::all fallbacks failed for $pkg"; exit 1; }
-          done
+            [ -f "$build" ] || continue
+            srcurl_line=$(grep -E '^TERMUX_PKG_SRCURL=' "$build" || true)
+            case "$srcurl_line" in
+              *file://*) continue ;;   # vendored above
+              *http*) gaps="$gaps $pkg" ;;
+              *) continue ;;           # git-only / empty: nothing to vendor
+            esac
+          done < all-dependencies.txt
+          if [ -n "$gaps" ]; then
+            echo "::error::Unvendored sources:$gaps — run scripts/vendor-termux-sources.ps1 and commit the missing tarballs."
+            exit 1
+          fi
+          echo "Coverage OK ($(( $(wc -w <<<"$handled") )) recipes wired to committed tarballs)."
 
           # ffmpeg does not need Android activity-manager wrappers, but termux-tools pulls
           # them in as bootstrap/runtime conveniences. termux-am builds an APK with Gradle
