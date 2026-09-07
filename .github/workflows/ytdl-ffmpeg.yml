@@ -71,8 +71,13 @@ jobs:
             case "$f" in *.sig) continue ;; esac
             name=$(basename "$f")
             pkg="${name%%-[0-9]*}"
-            # upstream ships the acl sources as the package "libacl"
-            [ "$pkg" = "acl" ] && pkg="libacl"
+            # Some Termux library recipes use a lib prefix absent from upstream tarballs.
+            case "$pkg" in
+              acl) pkg="libacl" ;;
+              dav1d) pkg="libdav1d" ;;
+              webrtc-audio-processing) pkg="libwebrtc-audio-processing" ;;
+              x264) pkg="libx264" ;;
+            esac
             build="packages/$pkg/build.sh"
             if [ ! -f "$build" ]; then
               echo "::notice::no packages/$pkg/build.sh at this pin — skipping $name"
