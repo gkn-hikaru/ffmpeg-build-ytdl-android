@@ -150,7 +150,7 @@ jobs:
             [sourceforge]="https://downloads.sourceforge.net https://phoenixnap.dl.sourceforge.net"
             [github]="https://github.com https://raw.githubusercontent.com"
             [ffmpeg]="https://ffmpeg.org https://www.ffmpeg.org"
-            [videolan]="https://code.videolan.org https://download.videolan.org"
+            [videolan]="https://downloads.videolan.org https://ftp.videolan.org"
           )
 
           get_mirror_type() {
@@ -168,9 +168,42 @@ jobs:
 
           # First SRCURL entry only; recipes may use
           # TERMUX_PKG_SRCURL="url" or TERMUX_PKG_SRCURL=( "u1" "u2" ).
+          # Recipes almost always interpolate variables, e.g.
+          #   TERMUX_PKG_SRCURL=https://downloads.videolan.org/.../${TERMUX_PKG_VERSION}/...
+          # so the raw grep hit must be expanded against the recipe's own
+          # TERMUX_PKG_VERSION/NAME assignments before curling. Unresolvable
+          # entries (still containing $ after expansion) and VCS URLs are
+          # skipped here — build-package.sh handles git checkouts itself.
+          get_pkg_var() {
+            grep -E "^TERMUX_PKG_$2=" "$1" \
+              | head -1 | sed -e 's/^[^=]*=//' -e 's/^["'"' ]*//;s/["'"' ]*$//' || true
+          }
+
           get_srcurl() {
-            grep -E '^TERMUX_PKG_SRCURL=' "$1" \
-              | grep -oE 'https?://[^" )]+' | head -1 || true
+            local build="$1"
+            local raw
+            raw=$(grep -E '^TERMUX_PKG_SRCURL=' "$build" \
+              | grep -oE '(https?|git)[^" )]+' | head -1 || true)
+            [ -z "$raw" ] && return 0
+            case "$raw" in git*|*\.git) return 0 ;; esac
+            local ver name
+            ver=$(get_pkg_var "$build" VERSION)
+            name=$(get_pkg_var "$build" NAME)
+            [ -z "$name" ] && name=$(basename "$(dirname "$build")")
+            case "$raw" in *TERMUX_PKG_VERSION*)
+              [ -z "$ver" ] && return 0 ;;
+            esac
+            case "$raw" in *TERMUX_PKG_NAME*)
+              [ -z "$name" ] && return 0 ;;
+            esac
+            local expanded="$raw"
+            # eval-free expansion of the two vars recipes actually use.
+            expanded=${expanded//'${TERMUX_PKG_VERSION}'/"$ver"}
+            expanded=${expanded//'$TERMUX_PKG_VERSION'/"$ver"}
+            expanded=${expanded//'${TERMUX_PKG_NAME}'/"$name"}
+            expanded=${expanded//'$TERMUX_PKG_NAME'/"$name"}
+            case "$expanded" in *'$'*|*'{'*|*'}'*) return 0 ;; esac
+            echo "$expanded"
           }
 
           get_sha256() {
@@ -416,11 +449,10 @@ jobs:
           if [ -f packages/termux-tools/build.sh ]; then
             sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
             sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
-            sed -i -E 's/[[:space:]]*,?[[:space:]]*tar-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
             sed -i -E 's/,,/,/g; s/\(\s*,/\(/; s/,\s*\)/\)/' packages/termux-tools/build.sh
             grep -nE "^TERMUX_PKG_DEPENDS=" packages/termux-tools/build.sh
           fi
-          
+
       # Mirrors upstream BUILD_FFMPEG.md from youtubedl-android. The custom TERMUX_PREFIX is
       # essential: stock Termux binaries bake /data/data/com.termux/... into their rpath and
       # cannot locate their own shared libs from another app's data dir.
