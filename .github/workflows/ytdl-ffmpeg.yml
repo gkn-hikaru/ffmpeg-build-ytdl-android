@@ -3,6 +3,9 @@ name: build-ffmpeg-with-fallback
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   TERMUX_PACKAGES_PIN: d53e42e0c52875ac69cfc9ff41b6c15d35b66153
 
@@ -10,6 +13,7 @@ jobs:
   build:
     name: ffmpeg for ${{ matrix.abi }}
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -22,109 +26,133 @@ jobs:
             termux_arch: x86_64
           - abi: x86
             termux_arch: i686
-    
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Checkout termux-packages at pinned commit
         run: |
-          git clone --depth 1 https://github.com/termux/termux-packages.git
+          set -euxo pipefail
+          rm -rf termux-packages
+          git init termux-packages
           cd termux-packages
+          git remote add origin https://github.com/termux/termux-packages.git
           git fetch --depth 1 origin ${{ env.TERMUX_PACKAGES_PIN }}
-          git checkout ${{ env.TERMUX_PACKAGES_PIN }}
+          git checkout FETCH_HEAD
 
       # Step 1: Discover all dependencies upfront
       - name: Discover all dependencies
         working-directory: termux-packages
         run: |
-          # Create the discovery script
+          set -euxo pipefail
           cat > find-all-deps.sh <<'EOF'
           #!/bin/bash
           set -euo pipefail
-          
+
           TARGET_PKG="${1:-ffmpeg}"
           DEPS_FILE=$(mktemp)
           VISITED_FILE=$(mktemp)
           touch "$VISITED_FILE"
-          
+
+          # TERMUX_PKG_DEPENDS looks like:
+          #   TERMUX_PKG_DEPENDS="libass, libx264 (>= 1:164), libvpx"
+          # so strip quotes, split on commas, drop "(...)" version
+          # constraints and trim whitespace to get bare package names.
+          parse_deps() {
+            grep -E '^TERMUX_PKG_DEPENDS=' "$1" \
+              | sed -e 's/^.*="//;s/".*$//' \
+              | tr ',' '\n' \
+              | sed -e 's/(.*//' -e 's/^ *//;s/ *$//' \
+              | grep -v '^$' || true
+          }
+
           get_deps() {
             local pkg="$1"
             local build_script="packages/$pkg/build.sh"
-            
-            grep -q "^${pkg}$" "$VISITED_FILE" && return 0
+
+            grep -qxF "$pkg" "$VISITED_FILE" && return 0
             echo "$pkg" >> "$VISITED_FILE"
-            
+
             if [ -f "$build_script" ]; then
-              deps=$(grep -oP 'TERMUX_PKG_DEPENDS=\K.*' "$build_script" | 
-                     tr -d '"' | tr -d '(' | tr -d ')' | tr ',' '\n' | 
-                     grep -v '^$' | grep -v 'termux-am' | grep -v 'termux-am-socket' || true)
-              
-              if [ -n "$deps" ]; then
-                echo "$deps" >> "$DEPS_FILE"
-                
-                while IFS= read -r dep; do
-                  [ -z "$dep" ] && continue
-                  get_deps "$dep"
-                done <<< "$deps"
-              fi
+              while IFS= read -r dep; do
+                [ -z "$dep" ] && continue
+                echo "$dep" >> "$DEPS_FILE"
+                get_deps "$dep"
+              done < <(parse_deps "$build_script")
             fi
           }
-          
+
           get_deps "$TARGET_PKG"
-          sort -u "$DEPS_FILE" | grep -v "^$" > all-dependencies.txt
-          
+          sort -u "$DEPS_FILE" | grep -v "^$" > all-dependencies.txt || true
+
           echo "=== Complete dependency list ==="
           cat all-dependencies.txt
           echo "Total unique dependencies: $(wc -l < all-dependencies.txt)"
           EOF
           chmod +x find-all-deps.sh
-          
+
           ./find-all-deps.sh ffmpeg
 
       # Step 2: Disable validation for committed files
       - name: Setup validation skip for committed files
         working-directory: termux-packages
         run: |
+          set -euxo pipefail
           mkdir -p .committed-packages
-          
+          rm -f .committed-packages/packages.txt
+          touch .committed-packages/packages.txt
+          shopt -s nullglob
           for f in "$GITHUB_WORKSPACE"/.github/workflows/deps/*; do
             [ -f "$f" ] || continue
             case "$f" in *.sig) continue ;; esac
-            
+
             name=$(basename "$f")
             pkg="${name%%-[0-9]*}"
-            
+
             case "$pkg" in
               acl) pkg="libacl" ;;
               dav1d) pkg="libdav1d" ;;
+              srt) pkg="libsrt" ;;
+              openh264) pkg="libopenh264" ;;
               webrtc-audio-processing) pkg="libwebrtc-audio-processing" ;;
               x264) pkg="libx264" ;;
             esac
-            
+
             if [ -f "packages/$pkg/build.sh" ]; then
               echo "$pkg" >> .committed-packages/packages.txt
             fi
           done
+          shopt -u nullglob
+          sort -u -o .committed-packages/packages.txt .committed-packages/packages.txt
+          cat .committed-packages/packages.txt || true
 
       # Step 3: Download missing deps with multi-mirror fallback
       - name: Download missing dependencies with fallback
         working-directory: termux-packages
         run: |
-          # Create the download script
+          set -euxo pipefail
+          mkdir -p downloads-pre
           cat > download-with-fallback.sh <<'EOF'
           #!/bin/bash
           set -euo pipefail
-          
+
+          mkdir -p downloads-pre
+
+          # Mirrors are host roots; fallback appends the full path
+          # after the original host (single ${url#*://*/} strip).
+          # The old table baked the first path component into the
+          # mirror (e.g. .../gnu) AND stripped it from the URL, which
+          # worked for gnu but dropped the org from github URLs.
           declare -A MIRRORS=(
-            [gnu]="https://mirrors.kernel.org/gnu https://ftp.gnu.org/gnu"
-            [nongnu]="https://download-mirror.savannah.gnu.org/releases https://mirror.csclub.uwaterloo.ca/nongnu"
+            [gnu]="https://mirrors.kernel.org https://ftp.gnu.org"
+            [nongnu]="https://download-mirror.savannah.gnu.org https://mirror.csclub.uwaterloo.ca"
             [sourceforge]="https://downloads.sourceforge.net https://phoenixnap.dl.sourceforge.net"
             [github]="https://github.com https://raw.githubusercontent.com"
-            [ffmpeg]="https://ffmpeg.org/releases https://www.ffmpeg.org/releases"
-            [x264]="https://code.videolan.org/videolan/x264 https://bitbucket.org/multicoreware/x264"
+            [ffmpeg]="https://ffmpeg.org https://www.ffmpeg.org"
+            [videolan]="https://code.videolan.org https://download.videolan.org"
           )
-          
+
           get_mirror_type() {
             local url="$1"
             case "$url" in
@@ -133,28 +161,28 @@ jobs:
               *sourceforge.net*) echo "sourceforge" ;;
               *github.com*|*githubusercontent.com*) echo "github" ;;
               *ffmpeg.org*) echo "ffmpeg" ;;
-              *x264*) echo "x264" ;;
+              *videolan.org*|*x264*) echo "videolan" ;;
               *) echo "generic" ;;
             esac
           }
-          
-          get_fallback_urls() {
-            local url="$1"
-            local mirror_type=$(get_mirror_type "$url")
-            local mirrors="${MIRRORS[$mirror_type]}"
-            local file_path="${url#*://*/}"
-            file_path="${file_path#*/}"
-            
-            for mirror in $mirrors; do
-              echo "${mirror}/${file_path}"
-            done
+
+          # First SRCURL entry only; recipes may use
+          # TERMUX_PKG_SRCURL="url" or TERMUX_PKG_SRCURL=( "u1" "u2" ).
+          get_srcurl() {
+            grep -E '^TERMUX_PKG_SRCURL=' "$1" \
+              | grep -oE 'https?://[^" )]+' | head -1 || true
           }
-          
+
+          get_sha256() {
+            grep -E '^TERMUX_PKG_SHA256=' "$1" \
+              | grep -oE '[0-9a-f]{64}' | head -1 || true
+          }
+
           download_with_fallback() {
             local url="$1"
             local output="$2"
             local expected_sha="$3"
-            
+
             if curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 120 \
                  --connect-timeout 15 --max-time 300 \
                  -o "$output" "$url"; then
@@ -162,18 +190,24 @@ jobs:
                 if echo "$expected_sha  $output" | sha256sum -c -; then
                   return 0
                 else
+                  echo "::warning::primary URL checksum mismatch: $url"
                   rm -f "$output"
                 fi
               else
                 return 0
               fi
             fi
-            
-            local fallback_urls=$(get_fallback_urls "$url")
-            
-            while IFS= read -r fallback_url; do
-              [ -z "$fallback_url" ] && continue
-              
+
+            local mirror_type
+            mirror_type=$(get_mirror_type "$url")
+            [ "$mirror_type" = "generic" ] && return 1
+            local mirrors="${MIRRORS[$mirror_type]}"
+            local path="${url#*://*/}"
+
+            for mirror in $mirrors; do
+              local fallback_url="${mirror}/${path}"
+              [ "$fallback_url" = "$url" ] && continue
+              echo "::notice::trying fallback $fallback_url"
               if curl -fsSL --retry 3 --retry-delay 5 --retry-max-time 120 \
                    --connect-timeout 15 --max-time 300 \
                    -o "$output" "$fallback_url"; then
@@ -181,56 +215,59 @@ jobs:
                   if echo "$expected_sha  $output" | sha256sum -c -; then
                     return 0
                   else
+                    echo "::warning::fallback checksum mismatch: $fallback_url"
                     rm -f "$output"
                   fi
                 else
                   return 0
                 fi
               fi
-            done <<< "$fallback_urls"
-            
+            done
+
             return 1
           }
-          
-          # Process missing packages
+
+          # Best effort: failures are tolerated here, the committed-tarballs
+          # step plus the attr/libacl fallback below are the trust anchor.
           while IFS= read -r pkg; do
             [ -z "$pkg" ] && continue
-            
+
             build_script="packages/$pkg/build.sh"
             [ ! -f "$build_script" ] && continue
-            
-            srcurl=$(grep -oP 'TERMUX_PKG_SRCURL=\K.*' "$build_script" | 
-                    head -1 | tr -d '"' | tr -d '(' | tr -d ')' || true)
-            sha256=$(grep -oP 'TERMUX_PKG_SHA256=\K.*' "$build_script" | 
-                    head -1 | tr -d '"' | tr -d '(' | tr -d ')' || true)
-            
+
+            srcurl=$(get_srcurl "$build_script")
+            sha256=$(get_sha256 "$build_script")
+
             [ -z "$srcurl" ] && continue
-            
-            fname=$(basename "$srcurl")
+
+            fname=$(basename "${srcurl%%\?*}")
             output_file="downloads-pre/$fname"
-            
+
             if [ ! -f "$output_file" ]; then
               if download_with_fallback "$srcurl" "$output_file" "$sha256"; then
-                actual_sha=$(sha256sum "$output_file" | cut -d' ' -f1)
-                sed -i "s|TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=$actual_sha|" "$build_script"
-                sed -i "s|TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=\"file:///home/builder/termux-packages/downloads-pre/$fname\"|" "$build_script"
+                echo "::notice::pre-fetched $pkg ($fname)"
+              else
+                echo "::warning::could not pre-fetch $pkg from $srcurl"
               fi
             fi
           done < missing-packages.txt
           EOF
           chmod +x download-with-fallback.sh
-          
+
           # Generate missing packages list
-          grep -v "^$" all-dependencies.txt | 
+          rm -f missing-packages.txt
+          touch missing-packages.txt
+          grep -v "^$" all-dependencies.txt 2>/dev/null | \
           while IFS= read -r pkg; do
             [ -z "$pkg" ] && continue
-            if ! grep -q "^${pkg}$" .committed-packages/packages.txt 2>/dev/null; then
+            if ! grep -qxF "$pkg" .committed-packages/packages.txt 2>/dev/null; then
               echo "$pkg"
             fi
-          done > missing-packages.txt
-          
-          ./download-with-fallback.sh
-          
+          done > missing-packages.txt || true
+
+          cat missing-packages.txt || true
+          ./download-with-fallback.sh || echo "::warning::pre-fetch had failures, continuing to committed tarballs"
+
       # Savannah's download hosts 502/504 constantly from CI, so there is NO network
       # fallback here: any source tarball the build can't fetch reliably is committed to
       # .github/workflows/deps/ (downloaded once by hand from a working mirror). For each
@@ -251,21 +288,44 @@ jobs:
           shopt -s nullglob
           dep_files=("$GITHUB_WORKSPACE"/.github/workflows/deps/*)
           shopt -u nullglob
-          if [ ${#dep_files[@]} -eq 0 ]; then
+          # Filter out .gitkeep/.sig so an empty deps/ dir still fails fast.
+          real_files=()
+          for f in "${dep_files[@]}"; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig|*.gitkeep) continue ;; esac
+            real_files+=("$f")
+          done
+          if [ ${#real_files[@]} -eq 0 ]; then
             echo "::error::No tarballs found in .github/workflows/deps/ — the checkout must contain them. Directory contents:"
             ls -la "$GITHUB_WORKSPACE"/.github/workflows/deps/ || true
             exit 1
           fi
+          point_recipe_at_file() {
+            local build="$1" fname="$2" sha="$3"
+            python3 - "$build" "$fname" "$sha" <<'PY'
+          import re, sys
+          build, fname, sha = sys.argv[1:4]
+          src = f'TERMUX_PKG_SRCURL="file:///home/builder/termux-packages/downloads-pre/{fname}"'
+          dst = f'TERMUX_PKG_SHA256={sha}'
+          txt = open(build).read()
+          # Collapse array forms first (SRCURL=( "u1" "u2" )), then single line.
+          txt = re.sub(r'TERMUX_PKG_SRCURL=\(.*?\)', src, txt, flags=re.S)
+          txt = re.sub(r'TERMUX_PKG_SRCURL=.*', src, txt)
+          txt = re.sub(r'TERMUX_PKG_SHA256=\(.*?\)', dst, txt, flags=re.S)
+          txt = re.sub(r'TERMUX_PKG_SHA256=.*', dst, txt)
+          open(build, 'w').write(txt)
+          PY
+          }
           handled=""
-          for f in "$GITHUB_WORKSPACE"/.github/workflows/deps/*; do
-            [ -f "$f" ] || continue
-            case "$f" in *.sig) continue ;; esac
+          for f in "${real_files[@]}"; do
             name=$(basename "$f")
             pkg="${name%%-[0-9]*}"
             # Some Termux library recipes use a lib prefix absent from upstream tarballs.
             case "$pkg" in
               acl) pkg="libacl" ;;
               dav1d) pkg="libdav1d" ;;
+              srt) pkg="libsrt" ;;
+              openh264) pkg="libopenh264" ;;
               webrtc-audio-processing) pkg="libwebrtc-audio-processing" ;;
               x264) pkg="libx264" ;;
             esac
@@ -283,8 +343,7 @@ jobs:
             handled="$handled $pkg"
             cp "$f" "downloads-pre/$name"
             sha=$(sha256sum "downloads-pre/$name" | cut -d' ' -f1)
-            sed -i -E "s|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=\"file:///home/builder/termux-packages/downloads-pre/$name\"|" "$build"
-            sed -i -E "s|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=$sha|" "$build"
+            point_recipe_at_file "$build" "$name" "$sha"
             echo "::notice::$name -> $pkg (sha $sha)"
             grep -nE "TERMUX_PKG_SRCURL=|TERMUX_PKG_SHA256=" "$build"
           done
@@ -292,9 +351,21 @@ jobs:
           # GitHub regenerated the archive for SRT's immutable v1.5.7 tag after this
           # Termux pin recorded its checksum. The downloaded source still identifies as
           # v1.5.7; update only the stale archive digest so all architectures agree.
+          # Tied to TERMUX_PACKAGES_PIN — re-verify on pin bump.
           if [ -f packages/libsrt/build.sh ]; then
-            sed -i -E 's|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b|' packages/libsrt/build.sh
-            grep -nE '^TERMUX_PKG_(SRCURL|SHA256)=' packages/libsrt/build.sh
+            if ! grep -q "file://" packages/libsrt/build.sh; then
+              python3 - packages/libsrt/build.sh 017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b <<'PY'
+          import re, sys
+          build, sha = sys.argv[1:3]
+          txt = open(build).read()
+          txt = re.sub(r'TERMUX_PKG_SHA256=\(.*?\)', f'TERMUX_PKG_SHA256={sha}', txt, flags=re.S)
+          txt = re.sub(r'TERMUX_PKG_SHA256=.*', f'TERMUX_PKG_SHA256={sha}', txt)
+          open(build, 'w').write(txt)
+          PY
+              grep -nE '^TERMUX_PKG_(SRCURL|SHA256)=' packages/libsrt/build.sh
+            else
+              echo "::notice::libsrt already pointed at committed tarball, skipping hardcoded SHA"
+            fi
           fi
 
           # Network fallback ONLY for packages the committed files didn't cover.
@@ -304,6 +375,7 @@ jobs:
           # Hashes are the verified artifacts this repo's deps/ folder was built from.
           # libacl (which builds the acl sources) is covered for future pin bumps; at this
           # pin it's normally already handled from deps/.
+          # Tied to TERMUX_PACKAGES_PIN — re-verify hashes on pin bump.
           for pkg in attr libacl; do
             build="packages/$pkg/build.sh"
             if [ ! -f "$build" ]; then
@@ -328,8 +400,7 @@ jobs:
               if curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 180 \
                    --connect-timeout 20 -o "downloads-pre/$fname" "$url"; then
                 if echo "$sha  downloads-pre/$fname" | sha256sum -c -; then
-                  sed -i -E "s|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=\"file:///home/builder/termux-packages/downloads-pre/$fname\"|" "$build"
-                  sed -i -E "s|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=$sha|" "$build"
+                  point_recipe_at_file "$build" "$fname" "$sha"
                   echo "::notice::fallback download OK: $fname"
                   break
                 fi
@@ -343,7 +414,9 @@ jobs:
           # them in as bootstrap/runtime conveniences. termux-am builds an APK with Gradle
           # and tries to install SDK components inside the Docker image, which fails on CI.
           if [ -f packages/termux-tools/build.sh ]; then
-            sed -i -E 's/, termux-am \([^)]*\), termux-am-socket \([^)]*\)//' packages/termux-tools/build.sh
+            sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
+            sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
+            sed -i -E 's/,,/,/g; s/\(\s*,/\(/; s/,\s*\)/\)/' packages/termux-tools/build.sh
             grep -nE "^TERMUX_PKG_DEPENDS=" packages/termux-tools/build.sh
           fi
 
@@ -356,6 +429,7 @@ jobs:
       - name: Build ffmpeg package in Termux docker (with retries)
         working-directory: termux-packages
         run: |
+          set -euxo pipefail
           cat > build-ffmpeg.sh <<'EOF'
           #!/bin/bash
           set -e
@@ -381,14 +455,17 @@ jobs:
           test "$SUCCESS" = "1"
 
       # Package exactly like upstream does: extract every produced deb (dev/static variants
-      # removed), keep the custom-prefix tree, and add the executables into usr/lib so the
-      # extracted dir is a complete --ffmpeg-location target (binaries + all shared libs).
+      # removed), keep the custom-prefix tree. Binaries are shipped separately as
+      # libffmpeg.so/libffprobe.so (Android jniLibs launchers); the zip stays libs-only
+      # to match the current ffmpeg/.../jniLibs layout consumed by FFmpeg.kt.
       - name: Package into jniLibs layout
         working-directory: termux-packages
         run: |
           set -euxo pipefail
           cd debs
-          find . -type f \( -name '*dev*' -o -name '*static*' \) -delete
+          # NOTE: '*-dev_*.deb' on purpose — '*dev*' would also match
+          # libavdevice (the runtime lib ffmpeg needs).
+          find . -type f \( -name '*-dev_*.deb' -o -name '*-static_*.deb' \) -delete
           mkdir -p extracted
           for f in ./*.deb; do dpkg-deb -x "$f" extracted/; done
           PKG=$(find extracted -type d -path '*youtubedl-android/usr' | head -1)
@@ -400,29 +477,27 @@ jobs:
           FFMPEG_BIN=$(find "$PKG" -type f -name ffmpeg -perm -u+x | head -1)
           FFPROBE_BIN=$(find "$PKG" -type f -name ffprobe -perm -u+x | head -1)
           test -n "$FFMPEG_BIN" && test -n "$FFPROBE_BIN"
-          install -m 755 "$FFMPEG_BIN" "$STAGE/lib/ffmpeg"
-          install -m 755 "$FFPROBE_BIN" "$STAGE/lib/ffprobe"
+          mkdir -p out/${{ matrix.abi }}
           cd stage
-          zip --symlinks -r ../libffmpeg.zip.so usr
-          cp "$FFMPEG_BIN" ../libffmpeg.so
-          cp "$FFPROBE_BIN" ../libffprobe.so
-          mkdir -p ../out/${{ matrix.abi }}
-          mv ../libffmpeg.zip.so ../out/${{ matrix.abi }}/
-          mv ../libffmpeg.so ../out/${{ matrix.abi }}/
-          mv ../libffprobe.so ../out/${{ matrix.abi }}/
+          zip --symlinks -r ../out/${{ matrix.abi }}/libffmpeg.zip.so usr
+          cd ..
+          install -m 755 "$FFMPEG_BIN" "out/${{ matrix.abi }}/libffmpeg.so"
+          install -m 755 "$FFPROBE_BIN" "out/${{ matrix.abi }}/libffprobe.so"
           # record what we actually built, for the changelog
-          "$STAGE/lib/ffmpeg" -version > /dev/null 2>&1 || true
+          # (can't exec the cross-compiled binary on x86_64 runners, so use strings)
           (strings "$FFMPEG_BIN" | grep -m1 'ffmpeg version') || true
+          ls -lh out/${{ matrix.abi }}/
 
       - name: Upload per-ABI artifact
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-${{ matrix.abi }}
-          path: termux-packages/out/
+          path: termux-packages/out/${{ matrix.abi }}/
 
   assemble:
     name: Assemble ffmpeg-jniLibs
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: build
     steps:
       - name: Download all ABI artifacts
@@ -436,7 +511,20 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p ffmpeg-jniLibs
-          cp -a artifacts/out/. ffmpeg-jniLibs/ 2>/dev/null || cp -a artifacts/. ffmpeg-jniLibs/
+          # Each per-ABI artifact now contains exactly the 3 files for
+          # that ABI; merge-multiple puts them under artifacts/<abi>/.
+          # Tolerate the old out/<abi>/ nesting if present.
+          if [ -d artifacts/out ]; then
+            cp -a artifacts/out/. ffmpeg-jniLibs/
+          else
+            cp -a artifacts/. ffmpeg-jniLibs/
+          fi
+          # Fail fast unless all 4 ABIs arrived.
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -f "ffmpeg-jniLibs/$abi/libffmpeg.so" || { echo "::error::missing $abi/libffmpeg.so"; find ffmpeg-jniLibs | sort; exit 1; }
+            test -f "ffmpeg-jniLibs/$abi/libffmpeg.zip.so" || { echo "::error::missing $abi/libffmpeg.zip.so"; find ffmpeg-jniLibs | sort; exit 1; }
+            test -f "ffmpeg-jniLibs/$abi/libffprobe.so" || { echo "::error::missing $abi/libffprobe.so"; find ffmpeg-jniLibs | sort; exit 1; }
+          done
           find ffmpeg-jniLibs -type f | sort
           zip -r ffmpeg-jniLibs.zip ffmpeg-jniLibs
 
