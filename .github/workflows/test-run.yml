@@ -9,7 +9,7 @@ permissions:
 env:
   # Pin of termux-packages master at ffmpeg 8.1. Bump periodically with:
   #   curl -s "https://api.github.com/repos/termux/termux-packages/commits?path=packages/ffmpeg/build.sh&per_page=1" | grep '"sha"' | head -1
-  TERMUX_PACKAGES_PIN: 63dabea17f2b2b7e4e4d8e1a3b5f9c2d0a8e6f1b
+  TERMUX_PACKAGES_PIN: a95402c35e8bbb2ef5d830093357d7938adaa0f8
 
 jobs:
   build:
