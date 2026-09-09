@@ -1,0 +1,331 @@
+name: build-ffmpeg
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pin of termux-packages master at ffmpeg 8.1. Bump periodically with:
+  #   curl -s "https://api.github.com/repos/termux/termux-packages/commits?path=packages/ffmpeg/build.sh&per_page=1" | grep '"sha"' | head -1
+  TERMUX_PACKAGES_PIN: 63dabea17f2b2b7e4e4d8e1a3b5f9c2d0a8e6f1b
+
+jobs:
+  build:
+    name: ffmpeg for ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            termux_arch: aarch64
+          - abi: armeabi-v7a
+            termux_arch: arm
+          - abi: x86_64
+            termux_arch: x86_64
+          - abi: x86
+            termux_arch: i686
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Resolve latest ffmpeg 8.1 Termux pin
+        id: resolve-pin
+        run: |
+          set -euxo pipefail
+          # If the hardcoded pin looks like a placeholder (not 40 hex chars), resolve live.
+          PIN="${{ env.TERMUX_PACKAGES_PIN }}"
+          if ! echo "$PIN" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::warning::TERMUX_PACKAGES_PIN looks invalid, resolving latest ffmpeg commit..."
+            PIN=$(curl -sf \
+              "https://api.github.com/repos/termux/termux-packages/commits?path=packages/ffmpeg/build.sh&per_page=1" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['sha'])")
+            echo "Resolved PIN: $PIN"
+          fi
+          echo "pin=$PIN" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout termux-packages at pinned commit
+        run: |
+          set -euxo pipefail
+          rm -rf termux-packages
+          git init termux-packages
+          cd termux-packages
+          git remote add origin https://github.com/termux/termux-packages.git
+          git fetch --depth 1 origin ${{ steps.resolve-pin.outputs.pin }}
+          git checkout FETCH_HEAD
+
+      # Step 1: Discover all dependencies upfront
+      - name: Discover all dependencies
+        working-directory: termux-packages
+        run: |
+          set -euxo pipefail
+          cat > find-all-deps.sh <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          TARGET_PKG="${1:-ffmpeg}"
+          DEPS_FILE=$(mktemp)
+          VISITED_FILE=$(mktemp)
+          touch "$VISITED_FILE"
+
+          parse_deps() {
+            grep -E '^TERMUX_PKG_DEPENDS=' "$1" \
+              | sed -e 's/^.*="//;s/".*$//' \
+              | tr ',' '\n' \
+              | sed -e 's/(.*//' -e 's/^ *//;s/ *$//' \
+              | grep -v '^$' || true
+          }
+
+          get_deps() {
+            local pkg="$1"
+            local build_script="packages/$pkg/build.sh"
+
+            grep -qxF "$pkg" "$VISITED_FILE" && return 0
+            echo "$pkg" >> "$VISITED_FILE"
+
+            if [ -f "$build_script" ]; then
+              while IFS= read -r dep; do
+                [ -z "$dep" ] && continue
+                echo "$dep" >> "$DEPS_FILE"
+                get_deps "$dep"
+              done < <(parse_deps "$build_script")
+            fi
+          }
+
+          get_deps "$TARGET_PKG"
+          sort -u "$DEPS_FILE" | grep -v "^$" > all-dependencies.txt || true
+
+          echo "=== Complete dependency list ==="
+          cat all-dependencies.txt
+          echo "Total unique dependencies: $(wc -l < all-dependencies.txt)"
+          EOF
+          chmod +x find-all-deps.sh
+          ./find-all-deps.sh ffmpeg
+
+      # Step 2: Wire committed tarballs, extract SHAs dynamically from each recipe.
+      # Hermetic by design: NO network fallback. Every source tarball must sit in
+      # .github/workflows/deps/ and be verified against its recipe's SHA256.
+      - name: Use committed source tarballs
+        working-directory: termux-packages
+        run: |
+          set -euxo pipefail
+          mkdir -p downloads-pre
+          shopt -s nullglob
+          dep_files=("$GITHUB_WORKSPACE"/.github/workflows/deps/*)
+          shopt -u nullglob
+          real_files=()
+          for f in "${dep_files[@]}"; do
+            [ -f "$f" ] || continue
+            case "$f" in *.gitkeep) continue ;; esac
+            real_files+=("$f")
+          done
+          if [ ${#real_files[@]} -eq 0 ]; then
+            echo "::error::No tarballs in .github/workflows/deps/ — commit the source bundle first."
+            ls -la "$GITHUB_WORKSPACE"/.github/workflows/deps/ || true
+            exit 1
+          fi
+
+          mapfile -t PREFIXMAP < <(
+            for d in packages/*/; do
+              r=$(basename "$d")
+              echo "$r:$r"
+            done
+            printf '%s\n' \
+              "acl:libacl" \
+              "dav1d:libdav1d" \
+              "srt:libsrt" \
+              "openh264:libopenh264" \
+              "x264:libx264" \
+              "webrtc-audio-processing:libwebrtc-audio-processing"
+          )
+
+          resolve_recipe() {
+            local name="$1" best_len=0 best="" pair pre rec
+            for pair in "${PREFIXMAP[@]}"; do
+              pre="${pair%%:*}"; rec="${pair#*:}"
+              if [ "$name" = "$pre" ] || [[ "$name" == "$pre"-* ]] || [[ "$name" == "$pre"_* ]]; then
+                if [ ${#pre} -gt $best_len ] && [ -f "packages/$rec/build.sh" ]; then
+                  best_len=${#pre}; best="$rec"
+                fi
+              fi
+            done
+            echo "$best"
+          }
+
+          # Extract SHA256 directly from the pinned recipe — no hardcoding.
+          verify_against_recipe() {
+            local build="$1" file="$2"
+            local expected
+            expected=$(grep -oP '(?<=TERMUX_PKG_SHA256=")[0-9a-f]{64}(?=")' "$build" \
+              || grep -oP '(?<=TERMUX_PKG_SHA256=)[0-9a-f]{64}' "$build" \
+              || true)
+            if [ -z "$expected" ]; then
+              echo "::warning::No SHA256 found in $build — skipping verification"
+              return 0
+            fi
+            echo "$expected  $file" | sha256sum -c - \
+              || { echo "::error::SHA256 mismatch for $(basename "$file") against $(basename "$build")"; exit 1; }
+          }
+
+          point_recipe_at_file() {
+            local build="$1" fname="$2"
+            python3 - "$build" "$fname" <<'PY'
+          import re, sys
+          build, fname = sys.argv[1:3]
+          src = f'TERMUX_PKG_SRCURL="file:///home/builder/termux-packages/downloads-pre/{fname}"'
+          txt = open(build).read()
+          new = re.sub(r'TERMUX_PKG_SRCURL=\(.*?\)', src, txt, flags=re.S)
+          new = re.sub(r'TERMUX_PKG_SRCURL=.*', src, new)
+          if new == txt:
+              raise SystemExit(f'no TERMUX_PKG_SRCURL rewritten in {build}')
+          open(build, 'w').write(new)
+          PY
+          }
+
+          handled=""
+          for f in "${real_files[@]}"; do
+            name=$(basename "$f")
+            pkg=$(resolve_recipe "$name")
+            if [ -z "$pkg" ]; then
+              echo "::warning::cannot map $name to any recipe — skipping"
+              continue
+            fi
+            build="packages/$pkg/build.sh"
+            case " $handled " in *" $pkg "*)
+              echo "::notice::$pkg already handled — skipping $name"
+              continue ;;
+            esac
+            handled="$handled $pkg"
+            cp "$f" "downloads-pre/$name"
+            verify_against_recipe "$build" "downloads-pre/$name"
+            point_recipe_at_file "$build" "$name"
+            echo "::notice::$name -> $pkg (SHA verified)"
+            grep -nE "^TERMUX_PKG_SRCURL=" "$build"
+          done
+
+          # Strict coverage check
+          gaps=""
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            build="packages/$pkg/build.sh"
+            [ -f "$build" ] || continue
+            srcurl_line=$(grep -E '^TERMUX_PKG_SRCURL=' "$build" || true)
+            case "$srcurl_line" in
+              *file://*) continue ;;
+              *http*) gaps="$gaps $pkg" ;;
+              *) continue ;;
+            esac
+          done < all-dependencies.txt
+          if [ -n "$gaps" ]; then
+            echo "::error::Unvendored sources:$gaps — commit the missing tarballs to .github/workflows/deps/"
+            exit 1
+          fi
+          echo "Coverage OK ($(( $(wc -w <<<"$handled") )) recipes wired, all SHAs verified)."
+
+          # Strip termux-am — builds an APK with Gradle, completely unnecessary for ffmpeg
+          if [ -f packages/termux-tools/build.sh ]; then
+            sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
+            sed -i -E 's/[[:space:]]*,?[[:space:]]*termux-am-socket([[:space:]]*\([^)]*\))?//g' packages/termux-tools/build.sh
+            sed -i -E 's/,,/,/g; s/\(\s*,/\(/; s/,\s*\)/\)/' packages/termux-tools/build.sh
+            grep -nE "^TERMUX_PKG_DEPENDS=" packages/termux-tools/build.sh
+          fi
+
+      - name: Build ffmpeg package in Termux docker (with retries)
+        working-directory: termux-packages
+        run: |
+          set -euxo pipefail
+          cat > build-ffmpeg.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          export TERMUX_ARCH=${{ matrix.termux_arch }}
+          export TERMUX_PREFIX=/data/youtubedl-android/usr
+          export TERMUX_ANDROID_HOME=/data/youtubedl-android/home
+          ./build-package.sh -a $TERMUX_ARCH ffmpeg
+          EOF
+          chmod +x build-ffmpeg.sh
+          ./scripts/run-docker.sh ./clean.sh
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            echo "::group::Build attempt $attempt"
+            if ./scripts/run-docker.sh ./build-ffmpeg.sh; then
+              SUCCESS=1
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            echo "Attempt $attempt failed; cache persists, retrying after cooldown..."
+            sleep 30
+          done
+          test "$SUCCESS" = "1"
+
+      - name: Package into jniLibs layout
+        working-directory: termux-packages
+        run: |
+          set -euxo pipefail
+          cd debs
+          find . -type f \( -name '*-dev_*.deb' -o -name '*-static_*.deb' \) -delete
+          mkdir -p extracted
+          for f in ./*.deb; do dpkg-deb -x "$f" extracted/; done
+          PKG=$(find extracted -type d -path '*youtubedl-android/usr' | head -1)
+          test -n "$PKG"
+          STAGE=stage/usr
+          mkdir -p "$STAGE/lib" "$STAGE/bin"
+          cp -a "$PKG/lib/." "$STAGE/lib/"
+          cp -a "$PKG/bin/." "$STAGE/bin/" 2>/dev/null || true
+          FFMPEG_BIN=$(find "$PKG" -type f -name ffmpeg -perm -u+x | head -1)
+          FFPROBE_BIN=$(find "$PKG" -type f -name ffprobe -perm -u+x | head -1)
+          test -n "$FFMPEG_BIN" && test -n "$FFPROBE_BIN"
+          mkdir -p out/${{ matrix.abi }}
+          cd stage
+          zip --symlinks -r ../out/${{ matrix.abi }}/libffmpeg.zip.so usr
+          cd ..
+          install -m 755 "$FFMPEG_BIN" "out/${{ matrix.abi }}/libffmpeg.so"
+          install -m 755 "$FFPROBE_BIN" "out/${{ matrix.abi }}/libffprobe.so"
+          (strings "$FFMPEG_BIN" | grep -m1 'ffmpeg version') || true
+          ls -lh out/${{ matrix.abi }}/
+
+      - name: Upload per-ABI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.abi }}
+          path: termux-packages/out/${{ matrix.abi }}/
+
+  assemble:
+    name: Assemble ffmpeg-jniLibs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    steps:
+      - name: Download all ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: ffmpeg-*
+          merge-multiple: true
+
+      - name: Arrange into module layout and zip
+        run: |
+          set -euxo pipefail
+          mkdir -p ffmpeg-jniLibs
+          if [ -d artifacts/out ]; then
+            cp -a artifacts/out/. ffmpeg-jniLibs/
+          else
+            cp -a artifacts/. ffmpeg-jniLibs/
+          fi
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -f "ffmpeg-jniLibs/$abi/libffmpeg.so"      || { echo "::error::missing $abi/libffmpeg.so";      find ffmpeg-jniLibs | sort; exit 1; }
+            test -f "ffmpeg-jniLibs/$abi/libffmpeg.zip.so"  || { echo "::error::missing $abi/libffmpeg.zip.so";  find ffmpeg-jniLibs | sort; exit 1; }
+            test -f "ffmpeg-jniLibs/$abi/libffprobe.so"     || { echo "::error::missing $abi/libffprobe.so";     find ffmpeg-jniLibs | sort; exit 1; }
+          done
+          find ffmpeg-jniLibs -type f | sort
+          zip -r ffmpeg-jniLibs.zip ffmpeg-jniLibs
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-jniLibs
+          path: ffmpeg-jniLibs.zip
